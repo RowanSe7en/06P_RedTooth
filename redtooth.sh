@@ -7,28 +7,39 @@
 # What it does:
 # - At login:  saves the post (hostname) you are on, and remembers the
 #              previous one.
-# - At logout: disconnects your AirPods so the next post can connect to
-#              them without you doing it by hand.
+# - At logout: disconnects EVERY connected Bluetooth device (any brand,
+#              any name) so the next post can connect to them without you
+#              doing it by hand. Devices on the exclude list stay connected.
 #
 # Policy:
 # - Runs as a systemd USER unit. No sudo, no daemon, nothing running
 #   between login and logout.
-# - Only devices whose name matches "AirPods" are ever touched.
-# - Disconnect only by default. Unpairing is opt-in (--remove-airpods).
-# - Never edits .zshrc / .bashrc / config.fish.
+# - Disconnect ONLY. RedTooth never unpairs or removes a device, so the
+#   pairing is preserved and the device can reconnect normally.
+# - Devices in the "exclude" list are never disconnected (keyboard, mouse).
+# - Never edits .zshrc / .bashrc / config.fish or any other existing file:
+#   it only creates its own files (listed below).
+# - --uninstall deletes every file RedTooth created (unit, script, config,
+#   state, log, backups), so the PC is back as it was.
 #
 # Running with no arguments = --on (install + activate).
 #
+# Excluding devices (keep a device connected at logout):
+#   Edit  ~/.config/redtooth/config  and set a comma-separated list:
+#     exclude=Logitech MX Keys,A4:C1:38:00:11:22
+#   Each entry is either a MAC address (exact match) or a device name
+#   (case-insensitive substring match). Connect the device and run
+#   --status to see its name and MAC address.
+#
 # Files:
-#   ~/redtooth-logs.txt              simple log, one line per event
-#   ~/.config/redtooth/state         current_host / previous_host / last_*
-#   ~/.config/redtooth/config        enabled / airpods_pattern / remove
+#   ~/redtooth-logs.txt              log, one line per event (in your home)
+#   ~/.config/redtooth/state         the post you are on + the previous one
+#   ~/.config/redtooth/config        enabled / exclude
 #   ~/.local/bin/redtooth            installed copy of this script
 #   ~/.config/systemd/user/redtooth.service
 #
-# Output style: every section prints the same way —
-#   ▌ Name   TAG   what it does
-#       ✔ item
+# Output: kept minimal on purpose. A section is  ▌ Name  [ON|OFF]  followed
+# by its lines. Only CONNECTED devices are ever listed.
 # Colors are disabled automatically when output is not a terminal, or
 # when NO_COLOR is set. Set FORCE_COLOR=1 to keep them in a pipe.
 #
@@ -37,7 +48,6 @@
 #   ./redtooth.sh --status
 #   ./redtooth.sh --off
 #   ./redtooth.sh --disconnect-now
-#   ./redtooth.sh --on --remove-airpods
 
 ###############################################################################
 # SHELL / SAFETY
@@ -60,6 +70,8 @@ LOG="$HOME/redtooth-logs.txt"
 LOG_MAX_LINES=500
 SCRIPT_NAME="$(basename "$0")"
 
+MAC_RE='^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$'
+
 ###############################################################################
 # COLORS
 ###############################################################################
@@ -73,7 +85,6 @@ UI=0
 if { [ -t 1 ] || [ -n "${FORCE_COLOR:-}" ]; } && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != "dumb" ]; then
 	C_RESET=$'\033[0m'
 	C_BOLD=$'\033[1m'
-	C_DIM=$'\033[2m'
 	C_ACCENT=$'\033[38;5;39m'
 	C_INFO=$'\033[38;5;75m'
 	C_OK=$'\033[38;5;78m'
@@ -81,18 +92,16 @@ if { [ -t 1 ] || [ -n "${FORCE_COLOR:-}" ]; } && [ -z "${NO_COLOR:-}" ] && [ "${
 	C_ERR=$'\033[38;5;203m'
 	C_MUTED=$'\033[38;5;245m'
 else
-	C_RESET="" C_BOLD="" C_DIM="" C_ACCENT="" C_INFO=""
+	C_RESET="" C_BOLD="" C_ACCENT="" C_INFO=""
 	C_OK="" C_WARN="" C_ERR="" C_MUTED=""
 fi
 
 ###############################################################################
-# OUTPUT HELPERS (one look for every message in the script)
+# OUTPUT HELPERS
 ###############################################################################
 
-ui_ok()   { printf "  %s✔%s %s\n" "$C_OK" "$C_RESET" "$*"; }
-ui_info() { printf "  %s›%s %s\n" "$C_INFO" "$C_RESET" "$*"; }
-ui_warn() { printf "  %s⚠%s %s%s%s\n" "$C_WARN" "$C_RESET" "$C_WARN" "$*" "$C_RESET"; }
-ui_err()  { printf "  %s✖ %s%s\n" "$C_ERR" "$*" "$C_RESET" >&2; }
+ui_ok()  { printf "  %s✔%s %s\n" "$C_OK" "$C_RESET" "$*"; }
+ui_err() { printf "  %s✖ %s%s\n" "$C_ERR" "$*" "$C_RESET" >&2; }
 
 fg256() {
 	# 256-color foreground escape, or nothing when colors are off.
@@ -114,51 +123,29 @@ or_dash() {
 	if [ -n "$1" ]; then printf '%s' "$1"; else printf '—'; fi
 }
 
-short_path() {
-	# Show $HOME as ~ to keep lines readable.
-	local p="$1"
-	case "$p" in
-		"$HOME") printf '~' ;;
-		"$HOME"/*) printf '%s' "~${p#"$HOME"}" ;;
-		*) printf '%s' "$p" ;;
-	esac
-}
-
 section_begin() {
-	# section_begin "Name" safe|medium|wipe|setup|info|on|off "what it does"
-	local tag tagc
-	case "$2" in
-		safe)   tag="SAFE";   tagc="$C_OK" ;;
-		medium) tag="MEDIUM"; tagc="$C_WARN" ;;
-		wipe)   tag="WIPE";   tagc="$C_ERR" ;;
-		setup)  tag="SETUP";  tagc="$C_ACCENT" ;;
-		info)   tag="INFO";   tagc="$C_ACCENT" ;;
-		on)     tag="ON";     tagc="$C_OK" ;;
-		off)    tag="OFF";    tagc="$C_MUTED" ;;
-		*)      tag="";       tagc="" ;;
+	# section_begin "Name" [on|off]
+	local tag="" tagc=""
+	case "${2:-}" in
+		on)  tag="ON";  tagc="$C_OK" ;;
+		off) tag="OFF"; tagc="$C_MUTED" ;;
 	esac
 
-	printf "\n  %s▌%s %s%-12s%s %s%s%-6s%s  %s%s%s\n" \
-		"$C_ACCENT" "$C_RESET" \
-		"$C_BOLD" "$1" "$C_RESET" \
-		"$C_BOLD" "$tagc" "$tag" "$C_RESET" \
-		"$C_MUTED" "$3" "$C_RESET"
+	printf "\n  %s▌%s %s%s%s" "$C_ACCENT" "$C_RESET" "$C_BOLD" "$1" "$C_RESET"
+	[ -n "$tag" ] && printf "  %s%s%s%s" "$C_BOLD" "$tagc" "$tag" "$C_RESET"
+	printf "\n"
 }
 
 section_skip() {
 	printf "    %s↷ %s%s\n" "$C_MUTED" "$*" "$C_RESET"
 }
 
-row() {
-	# row ICON COLOR "Label" "value"
-	printf "    %s%s%s %s%-12s%s %s%s%s\n" \
-		"$2" "$1" "$C_RESET" "$C_BOLD" "$3" "$C_RESET" "$C_MUTED" "$4" "$C_RESET"
-}
-
 dev_row() {
-	# dev_row ICON COLOR "status" "name" "mac"
-	printf "    %s%s%s %-20s %s%-14s%s %s%s%s\n" \
-		"$2" "$1" "$C_RESET" "$3" "$C_BOLD" "$4" "$C_RESET" "$C_MUTED" "$5" "$C_RESET"
+	# dev_row ICON COLOR "name" "mac" ["word"]
+	printf "    %s%s%s %s%-24s%s %s%s%s" \
+		"$2" "$1" "$C_RESET" "$C_BOLD" "$3" "$C_RESET" "$C_MUTED" "$4" "$C_RESET"
+	[ -n "${5:-}" ] && printf "  %s%s%s" "$2" "$5" "$C_RESET"
+	printf "\n"
 }
 
 ###############################################################################
@@ -186,8 +173,6 @@ banner() {
 	printf "  %s\n" "${C_BOLD}${l2}${C_RESET}"
 	printf "  %s\n" "${C_BOLD}${l3}${C_RESET}"
 	echo
-	printf "  %s%sRemember your post%s  %s·  free your AirPods at logout%s\n" \
-		"$C_BOLD" "$C_ACCENT" "$C_RESET" "$C_MUTED" "$C_RESET"
 	printf "  %sMade by Bilal Rouane · 42 intra: brouane%s\n" "$C_MUTED" "$C_RESET"
 	rule
 }
@@ -208,7 +193,7 @@ help_opt() {
 }
 
 usage() {
-	printf "\n  %s%sRedTooth%s  %s— remember your post, free your AirPods%s\n" \
+	printf "\n  %s%sRedTooth%s  %s— remember your post, free your Bluetooth devices%s\n" \
 		"$C_BOLD" "$C_ACCENT" "$C_RESET" "$C_MUTED" "$C_RESET"
 
 	help_heading "USAGE"
@@ -222,26 +207,39 @@ EOF
 	help_heading "OPTIONS"
 	help_opt "--on" \
 		"Install + activate (default). Safe to re-run." \
-		"Re-running never disconnects your AirPods."
+		"Re-running never disconnects your devices."
 	help_opt "--off" "Deactivate. Hooks do nothing, files are kept."
 	help_opt "--status" \
-		"Show active state, saved posts, your AirPods and the" \
-		"last log lines."
-	help_opt "--disconnect-now" "Disconnect the AirPods right now (no logout needed)"
-	help_opt "--remove-airpods" \
-		"At logout also UNPAIR the AirPods (you must re-pair" \
-		"them next time). Off by default."
-	help_opt "--keep-airpods" "At logout only disconnect (default)"
+		"Show active state, the saved posts, your connected" \
+		"Bluetooth devices and the last log lines."
+	help_opt "--disconnect-now" \
+		"Disconnect every connected Bluetooth device right now" \
+		"(excluded devices stay connected)"
 	help_opt "--uninstall" \
-		"Remove unit, script, config and state." \
-		"The log file in your home is kept."
+		"Remove everything RedTooth created (unit, script, config," \
+		"state, log, backups). Nothing else was ever changed."
 	help_opt "--help, -h" "Show this help"
+
+	help_heading "EXCLUDING DEVICES"
+	cat <<EOF
+    RedTooth disconnects every connected Bluetooth device. To keep some
+    connected (a keyboard, a mouse), list them in
+    ~/.config/redtooth/config as a comma-separated list:
+
+      exclude=Logitech MX Keys,A4:C1:38:00:11:22
+
+    Each entry is a MAC address (exact match) or a device name
+    (case-insensitive substring). Connect the device and run
+    $SCRIPT_NAME --status to see its name and MAC address.
+    Changes apply at the next logout.
+    RedTooth never unpairs or removes any device.
+EOF
 
 	help_heading "FILES"
 	cat <<EOF
-    ~/redtooth-logs.txt           simple log: one line per login/logout
-    ~/.config/redtooth/state      current_host / previous_host / last_login
-    ~/.config/redtooth/config     enabled / airpods_pattern / remove
+    ~/redtooth-logs.txt           log: one line per login / logout / device
+    ~/.config/redtooth/state      the post you are on + the previous one
+    ~/.config/redtooth/config     enabled / exclude
 EOF
 
 	help_heading "EXAMPLES"
@@ -250,7 +248,6 @@ EOF
     $SCRIPT_NAME --status
     $SCRIPT_NAME --off
     $SCRIPT_NAME --disconnect-now
-    $SCRIPT_NAME --on --remove-airpods
     $SCRIPT_NAME --uninstall
 EOF
 	echo
@@ -270,27 +267,17 @@ cfg_set() {
 	mv "$CONF.tmp" "$CONF"
 }
 
+cfg_unset() {
+	[ -f "$CONF" ] || return 0
+	grep -v "^$1=" "$CONF" > "$CONF.tmp" 2>/dev/null
+	mv "$CONF.tmp" "$CONF"
+}
+
 st_get() { sed -n "s/^$1=//p" "$STATE" 2>/dev/null | tail -n1; }
 
 short_host() { hostname 2>/dev/null | cut -d. -f1; }
 
 is_enabled() { [ "$(cfg_get enabled)" != "0" ]; }
-
-remove_mode() {
-	local r
-	r=$(cfg_get remove)
-	[ "$r" = "1" ]
-}
-
-ap_mode() { if remove_mode; then echo medium; else echo safe; fi; }
-
-ap_desc() {
-	if remove_mode; then
-		echo "Disconnect + unpair at logout  (re-pair needed)"
-	else
-		echo "Disconnect at logout  (pairing kept)"
-	fi
-}
 
 log_event() {
 	# log_event EVENT "details"
@@ -310,7 +297,6 @@ show_post() {
 	kv "Previous" "$(or_dash "$(st_get previous_host)")"
 	kv "Last login" "$(or_dash "$(st_get last_login)")" "$C_MUTED"
 	kv "Last logout" "$(or_dash "$(st_get last_logout)")" "$C_MUTED"
-	kv "Saved in" "$(short_path "$STATE")" "$C_MUTED"
 }
 
 ###############################################################################
@@ -349,7 +335,7 @@ do_start() {
 	trim_log
 
 	if [ "$UI" -eq 1 ]; then
-		section_begin "Login" info "Saving the post you are on"
+		section_begin "Login"
 		show_post
 		echo
 	fi
@@ -357,33 +343,57 @@ do_start() {
 }
 
 ###############################################################################
-# AIRPODS
+# BLUETOOTH
 ###############################################################################
 
-# prints "MAC<TAB>NAME" for paired devices whose name matches the pattern
-airpods_list() {
+# Prints "MAC<TAB>NAME" once for every device BlueZ knows about: the paired
+# devices plus anything else it lists (so a connected device that is not
+# paired is still found). Works on old BlueZ: it never uses
+# "devices Connected", connection state is checked per device with "info".
+bt_devices() {
 	command -v bluetoothctl >/dev/null 2>&1 || return 0
-	local pat list mac name
-	pat=$(cfg_get airpods_pattern); : "${pat:=AirPods}"
-	list=$(timeout 5 bluetoothctl paired-devices 2>/dev/null)
-	[ -n "$list" ] || list=$(timeout 5 bluetoothctl devices 2>/dev/null)
-	[ -n "$list" ] || return 0
-	while read -r _ mac name; do
-		[ -n "$mac" ] || continue
-		case "${name,,}" in *"${pat,,}"*) printf '%s\t%s\n' "$mac" "$name" ;; esac
-	done <<< "$list"
+	local kind mac name
+	{
+		timeout 5 bluetoothctl paired-devices 2>/dev/null
+		timeout 5 bluetoothctl devices 2>/dev/null
+	} | while read -r kind mac name; do
+		[ "$kind" = "Device" ] || continue
+		[[ "$mac" =~ $MAC_RE ]] || continue
+		printf '%s\t%s\n' "$mac" "${name:-$mac}"
+	done | awk -F'\t' '!seen[toupper($1)]++'
 }
 
 is_connected() {
 	timeout 5 bluetoothctl info "$1" 2>/dev/null | grep -q 'Connected: yes'
 }
 
-disconnect_airpods() {
-	local n_disc=0 n_already=0 n_fail=0 n_removed=0 n_found=0 mac name
+# is_excluded MAC NAME — true if the device matches an entry of the
+# "exclude=" list in the config (MAC = exact, name = substring, any case).
+is_excluded() {
+	local mac="$1" name="$2" list item
+	local -a items
+	list=$(cfg_get exclude)
+	[ -n "$list" ] || return 1
+	IFS=',' read -ra items <<< "$list"
+	for item in "${items[@]}"; do
+		item="${item#"${item%%[![:space:]]*}"}"
+		item="${item%"${item##*[![:space:]]}"}"
+		[ -n "$item" ] || continue
+		if [[ "$item" =~ $MAC_RE ]]; then
+			[ "${item^^}" = "${mac^^}" ] && return 0
+		else
+			case "${name,,}" in *"${item,,}"*) return 0 ;; esac
+		fi
+	done
+	return 1
+}
+
+disconnect_devices() {
+	local n_acted=0 n_found=0 mac name
 
 	if ! command -v bluetoothctl >/dev/null 2>&1; then
 		log_event NOTE "bluetoothctl not found"
-		[ "$UI" -eq 1 ] && section_skip "bluetoothctl not found — skipped"
+		[ "$UI" -eq 1 ] && section_skip "bluetoothctl not found"
 		return 0
 	fi
 
@@ -391,69 +401,53 @@ disconnect_airpods() {
 		[ -n "$mac" ] || continue
 		n_found=$((n_found + 1))
 
-		if is_connected "$mac"; then
-			if timeout 8 bluetoothctl disconnect "$mac" >/dev/null 2>&1; then
-				n_disc=$((n_disc + 1))
-				log_event AIRPODS "disconnected: $name"
-				[ "$UI" -eq 1 ] && dev_row "✔" "$C_OK" "disconnected" "$name" "$mac"
-			else
-				n_fail=$((n_fail + 1))
-				log_event AIRPODS "FAILED to disconnect: $name"
-				[ "$UI" -eq 1 ] && dev_row "✖" "$C_ERR" "disconnect FAILED" "$name" "$mac"
-			fi
-		else
-			n_already=$((n_already + 1))
-			log_event AIRPODS "already disconnected: $name"
-			[ "$UI" -eq 1 ] && dev_row "↷" "$C_MUTED" "already disconnected" "$name" "$mac"
+		# not connected: nothing to do, nothing to show
+		is_connected "$mac" || continue
+		n_acted=$((n_acted + 1))
+
+		if is_excluded "$mac" "$name"; then
+			log_event DEVICE "kept connected (excluded): $name"
+			[ "$UI" -eq 1 ] && dev_row "↷" "$C_MUTED" "$name" "$mac" "kept connected"
+			continue
 		fi
 
-		if remove_mode; then
-			if timeout 5 bluetoothctl remove "$mac" >/dev/null 2>&1; then
-				n_removed=$((n_removed + 1))
-				log_event AIRPODS "unpaired: $name"
-				[ "$UI" -eq 1 ] && dev_row "✔" "$C_WARN" "unpaired" "$name" "$mac"
-			else
-				n_fail=$((n_fail + 1))
-				log_event AIRPODS "FAILED to unpair: $name"
-				[ "$UI" -eq 1 ] && dev_row "✖" "$C_ERR" "unpair FAILED" "$name" "$mac"
-			fi
+		if timeout 8 bluetoothctl disconnect "$mac" >/dev/null 2>&1; then
+			log_event DEVICE "disconnected: $name"
+			[ "$UI" -eq 1 ] && dev_row "✔" "$C_OK" "$name" "$mac" "disconnected"
+		else
+			log_event DEVICE "FAILED to disconnect: $name"
+			[ "$UI" -eq 1 ] && dev_row "✖" "$C_ERR" "$name" "$mac" "disconnect failed"
 		fi
-	done < <(airpods_list)
+	done < <(bt_devices)
 
 	if [ "$n_found" -eq 0 ]; then
-		log_event NOTE "no AirPods found (Bluetooth off or nothing paired)"
-		[ "$UI" -eq 1 ] && section_skip "No AirPods found (Bluetooth off, or none paired)"
-		return 0
+		log_event NOTE "no Bluetooth devices found (Bluetooth off or none paired)"
+	elif [ "$n_acted" -eq 0 ]; then
+		log_event NOTE "no connected Bluetooth devices"
 	fi
-
-	if [ "$UI" -eq 1 ]; then
-		if [ "$n_fail" -gt 0 ]; then
-			printf "    %s✖ %d failed%s\n" "$C_ERR" "$n_fail" "$C_RESET"
-		elif [ "$n_disc" -eq 0 ] && [ "$n_removed" -eq 0 ]; then
-			printf "    %s✔ Already disconnected%s\n" "$C_MUTED" "$C_RESET"
-		else
-			printf "    %s✔ %d disconnected" "$C_OK" "$n_disc"
-			[ "$n_removed" -gt 0 ] && printf " · %d unpaired" "$n_removed"
-			printf "%s\n" "$C_RESET"
-		fi
-	fi
+	[ "$n_acted" -eq 0 ] && [ "$UI" -eq 1 ] && section_skip "Nothing connected"
 	return 0
 }
 
-show_airpods_devices() {
-	local mac name n=0
+# Lists only the CONNECTED devices (and the exclude list when it is set).
+show_devices() {
+	local mac name n=0 excl
+	excl=$(cfg_get exclude | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+
+	[ -n "$excl" ] && kv "Excluded" "$excl" "$C_WARN"
 
 	while IFS=$'\t' read -r mac name; do
 		[ -n "$mac" ] || continue
+		is_connected "$mac" || continue
 		n=1
-		if is_connected "$mac"; then
-			dev_row "●" "$C_OK" "connected" "$name" "$mac"
+		if is_excluded "$mac" "$name"; then
+			dev_row "●" "$C_WARN" "$name" "$mac" "excluded"
 		else
-			dev_row "○" "$C_MUTED" "not connected" "$name" "$mac"
+			dev_row "●" "$C_OK" "$name" "$mac"
 		fi
-	done < <(airpods_list)
+	done < <(bt_devices)
 
-	[ "$n" -eq 1 ] || section_skip "No AirPods found (Bluetooth off, or none paired)"
+	[ "$n" -eq 1 ] || section_skip "Nothing connected"
 }
 
 do_stop() {
@@ -468,17 +462,16 @@ do_stop() {
 	fi
 	log_event LOGOUT "session ended"
 
-	[ "$UI" -eq 1 ] && section_begin "AirPods" "$(ap_mode)" "$(ap_desc)"
-	disconnect_airpods
+	[ "$UI" -eq 1 ] && section_begin "Bluetooth"
+	disconnect_devices
 	[ "$UI" -eq 1 ] && echo
 	return 0
 }
 
 do_disconnect_now() {
-	section_begin "AirPods" "$(ap_mode)" "Disconnect now"
-	disconnect_airpods
+	section_begin "Bluetooth"
+	disconnect_devices
 	echo
-	ui_ok "${C_BOLD}Done.${C_RESET}"
 }
 
 ###############################################################################
@@ -488,14 +481,14 @@ do_disconnect_now() {
 unit_text() {
 cat <<'EOF'
 [Unit]
-Description=RedTooth: save your 1337 post at login, disconnect AirPods at logout
+Description=RedTooth: save your 1337 post at login, disconnect Bluetooth devices at logout
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=%h/.local/bin/redtooth _start
 ExecStop=%h/.local/bin/redtooth _stop
-TimeoutStopSec=20
+TimeoutStopSec=30
 
 [Install]
 WantedBy=default.target
@@ -508,35 +501,27 @@ do_on() {
 	local self was_active ts err
 	ts=$(date +%s)
 
-	section_begin "Install" setup "Script, systemd unit & config"
-
 	mkdir -p "$HOME/.local/bin" "$UNIT_DIR" "$CONF_DIR" || { ui_err "cannot create directories"; exit 1; }
 
-	# Script
+	# Script (an older installed copy is backed up as redtooth.bak.<time>)
 	self=$(readlink -f "$0")
 	if [ "$self" != "$(readlink -f "$BIN" 2>/dev/null)" ]; then
-		if [ -e "$BIN" ]; then
-			cp -p "$BIN" "$BIN.bak.$ts"
-			section_skip "Old script backed up: $(short_path "$BIN.bak.$ts")"
-		fi
-		cp "$self" "$BIN" && chmod 755 "$BIN" || { ui_err "cannot install $(short_path "$BIN")"; exit 1; }
+		[ -e "$BIN" ] && cp -p "$BIN" "$BIN.bak.$ts"
+		cp "$self" "$BIN" && chmod 755 "$BIN" || { ui_err "cannot install $BIN"; exit 1; }
 	fi
-	row "✔" "$C_OK" "Script" "$(short_path "$BIN")"
 
-	# Unit
+	# Unit (an older, different unit is backed up as redtooth.service.bak.<time>)
 	unit_text > "$UNIT.new"
 	if [ -e "$UNIT" ] && ! cmp -s "$UNIT" "$UNIT.new"; then
 		cp -p "$UNIT" "$UNIT.bak.$ts"
-		section_skip "Old unit backed up: $(short_path "$UNIT.bak.$ts")"
 	fi
 	mv "$UNIT.new" "$UNIT"
-	row "✔" "$C_OK" "Unit" "$(short_path "$UNIT")"
 
-	# Config
+	# Config (also drops the keys of the old AirPods-only version)
 	cfg_set enabled 1
-	[ -n "$(cfg_get airpods_pattern)" ] || cfg_set airpods_pattern AirPods
-	[ -n "$(cfg_get remove)" ] || cfg_set remove 0
-	row "✔" "$C_OK" "Config" "$(short_path "$CONF")"
+	grep -q '^exclude=' "$CONF" 2>/dev/null || cfg_set exclude ""
+	cfg_unset airpods_pattern
+	cfg_unset remove
 
 	# Activate
 	was_active=$(systemctl --user is-active "$NAME.service" 2>/dev/null)
@@ -545,57 +530,45 @@ do_on() {
 		|| { ui_err "could not enable the unit: $err"; exit 1; }
 	# unit already running: refresh the saved post without a logout hook
 	[ "$was_active" = "active" ] && "$BIN" _start >/dev/null 2>&1
-	row "✔" "$C_OK" "Activated" "runs at every login & logout"
 
-	section_begin "Post" setup "Saved at every login"
+	section_begin "Post"
 	show_post
 
-	section_begin "AirPods" "$(ap_mode)" "$(ap_desc)"
-	kv "Matches" "names containing \"$(cfg_get airpods_pattern)\"" "$C_MUTED"
-	show_airpods_devices
-
-	section_begin "Log" info "One simple line per login / logout"
-	kv "File" "$(short_path "$LOG")" "$C_MUTED"
+	section_begin "Bluetooth"
+	show_devices
 
 	echo
 	ui_ok "${C_BOLD}RedTooth is active.${C_RESET}"
 }
 
 do_off() {
-	section_begin "RedTooth" off "Deactivate"
 	# enabled=0 first, so the stop hook fired by --now does nothing
 	cfg_set enabled 0
 	systemctl --user disable --now "$NAME.service" >/dev/null 2>&1
-	row "✔" "$C_OK" "Hooks" "login & logout do nothing now"
-	row "✔" "$C_OK" "Files" "kept, nothing deleted"
+	section_begin "RedTooth" off
 	echo
-	ui_info "Turn it back on with:  $SCRIPT_NAME --on"
-}
-
-rm_item() {
-	# rm_item "Label" path
-	if [ -e "$2" ]; then
-		/bin/rm -rf -- "$2" 2>/dev/null
-		row "✔" "$C_OK" "$1" "$(short_path "$2")"
-	else
-		section_skip "$1 — not found, skipped"
-	fi
+	ui_ok "${C_BOLD}RedTooth is off.${C_RESET}"
 }
 
 do_uninstall() {
-	section_begin "Uninstall" wipe "Remove unit, script, config & state"
+	# enabled=0 first, so the stop hook fired by --now does nothing
 	cfg_set enabled 0
 	systemctl --user disable --now "$NAME.service" >/dev/null 2>&1
-	rm_item "Unit" "$UNIT"
-	rm_item "Script" "$BIN"
-	rm_item "Config" "$CONF_DIR"
-	systemctl --user daemon-reload >/dev/null 2>&1
 
+	# everything RedTooth ever created
+	/bin/rm -rf -- \
+		"$UNIT" "$UNIT.new" "$UNIT".bak.* \
+		"$UNIT_DIR/default.target.wants/$NAME.service" \
+		"$BIN" "$BIN".bak.* \
+		"$CONF_DIR" \
+		"$LOG" "$LOG.tmp" 2>/dev/null
+
+	# folders RedTooth may have created: removed only if they are now empty
+	rmdir "$UNIT_DIR/default.target.wants" "$UNIT_DIR" \
+		"$HOME/.config/systemd" "$HOME/.local/bin" 2>/dev/null
+
+	systemctl --user daemon-reload >/dev/null 2>&1
 	echo
-	if [ -e "$LOG" ]; then
-		ui_info "Log kept: $(short_path "$LOG")  (delete it by hand if you want)"
-	fi
-	ui_info "Any *.bak.* backups next to the removed files were left in place."
 	ui_ok "${C_BOLD}RedTooth removed.${C_RESET}"
 }
 
@@ -604,36 +577,27 @@ do_uninstall() {
 ###############################################################################
 
 do_status() {
-	local active mode line
+	local active line
 
 	active=$(systemctl --user is-active "$NAME.service" 2>/dev/null)
 
 	if [ ! -f "$UNIT" ]; then
-		section_begin "RedTooth" off "Not installed"
-		section_skip "Run  $SCRIPT_NAME --on  to install and activate"
+		section_begin "RedTooth" off
+		section_skip "Not installed — run  $SCRIPT_NAME --on"
+	elif is_enabled && [ "$active" = "active" ]; then
+		section_begin "RedTooth" on
 	else
-		if is_enabled && [ "$active" = "active" ]; then mode=on; else mode=off; fi
-		section_begin "RedTooth" "$mode" "Login & logout hooks"
-		if [ "$mode" = on ]; then
-			kv "Active" "yes" "$C_OK$C_BOLD"
-		else
-			kv "Active" "no  (config enabled=$(or_dash "$(cfg_get enabled)"), systemd: ${active:-unknown})" "$C_WARN"
-		fi
-		kv "At login" "saves the post you are on" "$C_MUTED"
-		if remove_mode; then
-			kv "At logout" "disconnects + unpairs AirPods" "$C_WARN"
-		else
-			kv "At logout" "disconnects AirPods (pairing kept)" "$C_MUTED"
-		fi
+		section_begin "RedTooth" off
+		section_skip "Run  $SCRIPT_NAME --on"
 	fi
 
-	section_begin "Post" info "Where you are, where you were"
+	section_begin "Post"
 	show_post
 
-	section_begin "AirPods" "$(ap_mode)" "$(ap_desc)"
-	show_airpods_devices
+	section_begin "Bluetooth"
+	show_devices
 
-	section_begin "Log" info "$(short_path "$LOG")  (last 8)"
+	section_begin "Log"
 	if [ -s "$LOG" ]; then
 		tail -n 8 "$LOG" | while IFS= read -r line; do
 			printf "    %s%s%s\n" "$C_MUTED" "$line" "$C_RESET"
@@ -649,7 +613,6 @@ do_status() {
 ###############################################################################
 
 action=""
-rm_set=""
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -658,8 +621,6 @@ while [ $# -gt 0 ]; do
 		--status|status)   action=status ;;
 		--disconnect-now)  action=disconnect ;;
 		--uninstall)       action=uninstall ;;
-		--remove-airpods)  rm_set=1 ;;
-		--keep-airpods)    rm_set=0 ;;
 		_start)            action=_start ;;
 		_stop)             action=_stop ;;
 		--help|-h)
@@ -675,7 +636,7 @@ while [ $# -gt 0 ]; do
 	shift
 done
 
-[ -z "$action" ] && [ -z "$rm_set" ] && action=on
+[ -z "$action" ] && action=on
 
 ###############################################################################
 # MAIN
@@ -688,16 +649,6 @@ case "$action" in
 	*) UI=1; banner ;;
 esac
 
-if [ -n "$rm_set" ]; then
-	cfg_set remove "$rm_set"
-	echo
-	if [ "$rm_set" = 1 ]; then
-		ui_warn "At logout the AirPods will be disconnected AND unpaired (re-pair needed)."
-	else
-		ui_ok "At logout the AirPods will only be disconnected."
-	fi
-fi
-
 case "$action" in
 	on)         do_on ;;
 	off)        do_off ;;
@@ -706,7 +657,6 @@ case "$action" in
 	uninstall)  do_uninstall ;;
 	_start)     do_start ;;
 	_stop)      do_stop ;;
-	"")         echo ;;
 esac
 
 exit 0
